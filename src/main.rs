@@ -4,24 +4,42 @@
 
 use ::std::mem;
 use ::std::ptr::null;
+use ::std::thread;
+use crossbeam::channel::{Receiver, Sender};
 use windows::{
     core::{HSTRING, PWSTR},
     w,
     Win32::{
-        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
-        Graphics::Gdi::{
-            BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, SetBkColor,
-            SetTextColor, DT_CENTER, DT_NOCLIP, PAINTSTRUCT,
-        },
+        Foundation::*,
+        Graphics::Gdi::*,
         System::{Environment::GetCommandLineW, LibraryLoader::GetModuleHandleW},
-        UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostQuitMessage,
-            RegisterClassW, ShowWindow, TranslateMessage, CW_USEDEFAULT, MSG, SHOW_WINDOW_CMD,
-            SW_SHOWDEFAULT, WM_DESTROY, WM_PAINT, WNDCLASSW, WS_EX_ACCEPTFILES,
-            WS_OVERLAPPEDWINDOW, WS_VISIBLE,
-        },
+        UI::WindowsAndMessaging::*,
     },
 };
+
+enum Message {
+    Render,
+    QuitRender,
+}
+struct AppState(Sender<Message>);
+
+fn BeginListening(recv: Receiver<Message>) {
+    thread::spawn(move || loop {
+        let received_message = recv.recv();
+        match received_message {
+            Ok(message) => match message {
+                Message::Render => {
+                    println!("render request!");
+                }
+                Message::QuitRender => {
+                    println!("goodbye world");
+                    break;
+                }
+            },
+            Err(err) => println!("{err}"),
+        }
+    });
+}
 
 fn wWinMain(hInstance: HINSTANCE, hPrevInstance: HINSTANCE, pCmdLine: PWSTR, nCmdShow: i32) -> i32 {
     const WINDOWCLASSNAME: &HSTRING = w!("Main Window Class");
@@ -39,6 +57,9 @@ fn wWinMain(hInstance: HINSTANCE, hPrevInstance: HINSTANCE, pCmdLine: PWSTR, nCm
         debug_assert!(regc_r != 0);
     };
 
+    let (sender, receiver) = crossbeam::channel::bounded(30);
+    let appstate = AppState(sender);
+
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_ACCEPTFILES,
@@ -52,13 +73,15 @@ fn wWinMain(hInstance: HINSTANCE, hPrevInstance: HINSTANCE, pCmdLine: PWSTR, nCm
             None,
             None,
             hInstance,
-            null(),
+            &appstate as *const AppState as *const _,
         )
     };
     if hwnd.0 == 0 {
         dbg!("Failed to create window instance");
         return 1;
     }
+
+    BeginListening(receiver);
 
     unsafe {
         ShowWindow(hwnd, SHOW_WINDOW_CMD(nCmdShow as u32));
@@ -92,35 +115,25 @@ fn main() {
 }
 
 extern "system" fn wndproc(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let appstate: &AppState = unsafe {
+        if message == WM_CREATE {
+            let pCreate = lparam.0 as *const CREATESTRUCTW;
+            let pState = (*pCreate).lpCreateParams as *const AppState;
+            SetWindowLongPtrW(window, GWLP_USERDATA, pState as isize);
+            &*pState
+        } else {
+            &*(GetWindowLongPtrW(window, GWLP_USERDATA) as *const AppState)
+        }
+    };
+
     unsafe {
         match message as u32 {
             WM_PAINT => {
-                let mut ps = mem::zeroed::<PAINTSTRUCT>();
-                let hdc = BeginPaint(window, &mut ps);
-                let color_brush = CreateSolidBrush(0x000000FF);
-
-                FillRect(hdc, &ps.rcPaint, color_brush);
-
-                SetTextColor(hdc, 0x00FFFFFF);
-                SetBkColor(hdc, 0x00FF00FF);
-                let mut TextRect = RECT {
-                    left: 10,
-                    right: 100,
-                    top: 50,
-                    bottom: 25,
-                };
-                DrawTextW(
-                    hdc,
-                    w!("Hello World").as_wide(),
-                    &mut TextRect,
-                    DT_CENTER | DT_NOCLIP,
-                );
-
-                DeleteObject(color_brush);
-                EndPaint(window, &ps);
+                let _ = appstate.0.try_send(Message::Render);
                 LRESULT(0)
             }
             WM_DESTROY => {
+                let _ = appstate.0.send(Message::QuitRender);
                 PostQuitMessage(0); // Push special message to queue, value 0, tells GetMessageW to stop in the next iteration
                 LRESULT(0)
             }
