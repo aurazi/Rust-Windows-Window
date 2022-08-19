@@ -8,8 +8,11 @@ use windows::{
     core::{HSTRING, PWSTR},
     w,
     Win32::{
-        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
-        Graphics::Gdi::{BeginPaint, CreateSolidBrush, EndPaint, FillRect, PAINTSTRUCT},
+        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Graphics::Gdi::{
+            BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, SetBkColor,
+            SetTextColor, DT_CENTER, DT_NOCLIP, PAINTSTRUCT,
+        },
         System::{Environment::GetCommandLineW, LibraryLoader::GetModuleHandleW},
         UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostQuitMessage,
@@ -94,12 +97,26 @@ extern "system" fn wndproc(window: HWND, message: u32, wparam: WPARAM, lparam: L
             WM_PAINT => {
                 let mut ps = mem::zeroed::<PAINTSTRUCT>();
                 let hdc = BeginPaint(window, &mut ps);
-
-                // 0x00bbggrr
-                let color_brush = CreateSolidBrush(0x00FF00FF);
+                let color_brush = CreateSolidBrush(0x000000FF);
 
                 FillRect(hdc, &ps.rcPaint, color_brush);
 
+                SetTextColor(hdc, 0x00FFFFFF);
+                SetBkColor(hdc, 0x00FF00FF);
+                let mut TextRect = RECT {
+                    left: 10,
+                    right: 100,
+                    top: 50,
+                    bottom: 25,
+                };
+                DrawTextW(
+                    hdc,
+                    w!("Hello World").as_wide(),
+                    &mut TextRect,
+                    DT_CENTER | DT_NOCLIP,
+                );
+
+                DeleteObject(color_brush);
                 EndPaint(window, &ps);
                 LRESULT(0)
             }
