@@ -1,14 +1,16 @@
 // https://docs.microsoft.com/en-us/windows/win32/learnwin32/your-first-windows-program
-// TODO: make timer thing
-// idk brah
+// the way its designed is finikiy.... i don't really like it
+// maybe i'll figure something else out
 
 #![allow(non_snake_case)]
 
 use ::std::mem;
+use ::std::sync::atomic::AtomicI64;
 use ::std::sync::atomic::Ordering;
+use ::std::sync::Arc;
 use ::std::thread;
-use atomic_float::AtomicF64;
 use crossbeam::channel::{Receiver, Sender};
+use parking_lot::RwLock;
 use windows::{
     core::{HSTRING, PWSTR},
     w,
@@ -26,11 +28,15 @@ enum Message {
     Render(HWND),
     QuitRender(Sender<()>),
 }
-struct AppState(Sender<Message>);
+struct AppState(Sender<Message>, RwLock<SharedApp>);
+struct SharedApp {
+    dt: f64,
+    elapsed: f64,
+}
 struct HighResolutionTimer {
-    t_beginning_of_time: AtomicF64,
-    t_before: AtomicF64,
-    t_after: AtomicF64,
+    t_beginning_of_time: i64,
+    t_before: AtomicI64,
+    t_after: AtomicI64,
     c_frequency: f64,
 } // https://docs.microsoft.com/en-us/windows/win32/winmsg/about-timers
 impl HighResolutionTimer {
@@ -43,11 +49,10 @@ impl HighResolutionTimer {
         unsafe {
             QueryPerformanceCounter(&mut t_beginning_of_time);
         }
-        let t_beginning_of_time = t_beginning_of_time as f64;
         Self {
-            t_beginning_of_time: AtomicF64::new(t_beginning_of_time),
-            t_before: AtomicF64::new(t_beginning_of_time),
-            t_after: AtomicF64::new(t_beginning_of_time),
+            t_beginning_of_time: t_beginning_of_time,
+            t_before: AtomicI64::new(t_beginning_of_time),
+            t_after: AtomicI64::new(t_beginning_of_time),
             c_frequency: freq as f64,
         }
     }
@@ -55,59 +60,73 @@ impl HighResolutionTimer {
         unsafe {
             let mut f = 0;
             QueryPerformanceCounter(&mut f);
-            self.t_before.store(f as f64, Ordering::Release);
+            self.t_before.store(f, Ordering::Release);
         }
     }
     fn set_end(&mut self) {
         unsafe {
             let mut f = 0;
             QueryPerformanceCounter(&mut f);
-            self.t_after.store(f as f64, Ordering::Release);
+            self.t_after.store(f, Ordering::Release);
         }
     }
     fn get_delta(&self) -> f64 {
-        (self.t_after.load(Ordering::Acquire) - self.t_before.load(Ordering::Acquire))
+        (self.t_after.load(Ordering::Acquire) as f64 - self.t_before.load(Ordering::Acquire) as f64)
             / self.c_frequency
     }
     fn get_elapsed(&self) -> f64 {
-        (self.t_after.load(Ordering::Acquire) - self.t_before.load(Ordering::Acquire))
+        (self.t_after.load(Ordering::Acquire) as f64 - self.t_beginning_of_time as f64)
             / self.c_frequency
     }
 }
 
-fn BeginListening(recv: Receiver<Message>) {
+fn BeginListening(recv: Receiver<Message>, appstate: Arc<AppState>) {
     thread::spawn(move || {
-        let mut screen_buffer: Vec<u32> = vec![];
+        let mut screen_buffer: Vec<(u8, u8, u8)> = vec![];
 
         loop {
             let received_message = recv.recv();
             match received_message {
                 Ok(message) => match message {
                     Message::Render(hwnd) => unsafe {
+                        let rl = appstate.1.read();
+                        let dt = rl.dt;
+                        let elapsed = rl.elapsed;
+                        mem::drop(rl);
+
                         let mut window_rect = RECT::default();
                         GetWindowRect(hwnd, &mut window_rect);
                         let (window_width, window_height) = (
                             window_rect.right - window_rect.left,
                             window_rect.bottom - window_rect.top,
                         );
+                        let (middle_w, middle_h) = (window_width / 2, window_height / 2);
                         let buffer_size = window_width * window_height;
                         if buffer_size as usize > screen_buffer.capacity() {
                             let cost = buffer_size as usize - (screen_buffer.capacity());
                             screen_buffer.reserve_exact(cost);
-                            screen_buffer.resize(buffer_size as usize, 0x00000000);
+                            screen_buffer.resize(buffer_size as usize, (0, 0, 0));
                         }
-                        // 0x00rrggbb
                         // do not iterate over entire buffer or you'll be editing parts that
                         // are not being rendered.
+
+                        let breathing = (0xFF as f64 * (f64::sin(elapsed) * 0.5 + 0.5)) as u8;
                         for index in 0i32..buffer_size {
                             let (px, py) = (index % window_width, index / window_width);
-                            let p = &mut screen_buffer[index as usize];
-                            *p = (px + py) as u32;
+                            let distance_to_middle =
+                                f64::sqrt(((px - middle_w) ^ 2 + (py - middle_h) ^ 2) as f64);
+                            let (b, g, r) = &mut screen_buffer[index as usize];
+                            // danger of overflowing oh well!
+                            // however, it creates some sweet patterns!
+                            let breathing = (breathing as f64 * distance_to_middle) as u8;
+                            *r = breathing;
+                            *g = breathing;
+                            *b = breathing;
                         }
 
                         let mut bitmapi = BITMAPINFO::default();
                         bitmapi.bmiHeader.biSize = mem::size_of::<BITMAPINFOHEADER>() as u32;
-                        bitmapi.bmiHeader.biBitCount = 32;
+                        bitmapi.bmiHeader.biBitCount = 24;
                         bitmapi.bmiHeader.biCompression = BI_RGB as u32;
                         bitmapi.bmiHeader.biPlanes = 1; // has to be 1 idk why
                         bitmapi.bmiHeader.biWidth = window_width;
@@ -150,6 +169,23 @@ fn BeginListening(recv: Receiver<Message>) {
     });
 }
 
+fn BeginEngine(sender: Sender<Message>, hwnd: HWND, appstate: Arc<AppState>) {
+    let mut timer = HighResolutionTimer::new();
+    let fps_r = 1.0 / FPS as f64;
+    thread::spawn(move || loop {
+        timer.set_end();
+        let delta = timer.get_delta();
+        let elapsed = timer.get_elapsed();
+        if delta >= fps_r {
+            let _ = sender.try_send(Message::Render(hwnd));
+            timer.set_start();
+        }
+        let mut wl = appstate.1.write();
+        wl.dt = delta;
+        wl.elapsed = elapsed;
+    });
+}
+
 fn wWinMain(
     hInstance: HINSTANCE,
     _hPrevInstance: HINSTANCE,
@@ -172,8 +208,14 @@ fn wWinMain(
     };
 
     let (sender, receiver) = crossbeam::channel::bounded(FPS);
-    let mut appstate = AppState(sender);
-    let mut timer = HighResolutionTimer::new();
+    let appstate = Arc::new(AppState(
+        sender.clone(),
+        RwLock::new(SharedApp {
+            dt: 0.0,
+            elapsed: 0.0,
+        }),
+    ));
+    let appstate_message_r = appstate.clone();
 
     let hwnd = unsafe {
         CreateWindowExW(
@@ -188,7 +230,7 @@ fn wWinMain(
             None,
             None,
             hInstance,
-            &appstate as *const AppState as *const _,
+            &appstate_message_r as *const Arc<AppState> as *const _,
         )
     };
     if hwnd.0 == 0 {
@@ -196,7 +238,8 @@ fn wWinMain(
         return 1;
     }
 
-    BeginListening(receiver);
+    BeginListening(receiver, appstate.clone());
+    BeginEngine(sender, hwnd, appstate.clone());
 
     unsafe {
         ShowWindow(hwnd, SHOW_WINDOW_CMD(nCmdShow as u32));
@@ -230,14 +273,14 @@ fn main() {
 }
 
 extern "system" fn wndproc(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let appstate: &mut AppState = unsafe {
+    let appstate: &Arc<AppState> = unsafe {
         if message == WM_CREATE {
             let pCreate = lparam.0 as *const CREATESTRUCTW;
-            let pState = (*pCreate).lpCreateParams as *mut AppState;
+            let pState = (*pCreate).lpCreateParams as *const Arc<AppState>;
             SetWindowLongPtrW(window, GWLP_USERDATA, pState as isize);
-            &mut *pState
+            &*pState
         } else {
-            &mut *(GetWindowLongPtrW(window, GWLP_USERDATA) as *mut AppState)
+            &*(GetWindowLongPtrW(window, GWLP_USERDATA) as *const Arc<AppState>)
         }
     };
 
